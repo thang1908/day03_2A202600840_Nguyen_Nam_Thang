@@ -7,6 +7,16 @@ from src.core.llm_provider import LLMProvider
 from src.telemetry.logger import logger
 from src.telemetry.metrics import tracker
 
+
+def normalize_order_id(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    match = re.fullmatch(r"\s*ORD[-\s]?(\d{3})\s*", value, flags=re.IGNORECASE)
+    if not match:
+        return value
+    return f"ORD-{match.group(1)}"
+
+
 class ReActAgent:
     """
     ReAct-style Agent that follows the Thought-Action-Observation loop.
@@ -134,9 +144,18 @@ Rules:
         try:
             signature = inspect.signature(func)
             if "_positional" in args:
-                result = func(*args["_positional"])
+                parameter_names = list(signature.parameters)
+                positional_args = [
+                    normalize_order_id(value) if index < len(parameter_names) and parameter_names[index] == "order_id" else value
+                    for index, value in enumerate(args["_positional"])
+                ]
+                result = func(*positional_args)
             else:
-                accepted_args = {name: value for name, value in args.items() if name in signature.parameters}
+                accepted_args = {
+                    name: normalize_order_id(value) if name == "order_id" else value
+                    for name, value in args.items()
+                    if name in signature.parameters
+                }
                 result = func(**accepted_args)
             return json.dumps(result, ensure_ascii=False)
         except TypeError as exc:

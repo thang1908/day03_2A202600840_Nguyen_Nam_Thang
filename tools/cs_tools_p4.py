@@ -49,32 +49,37 @@ def check_product_availability(product_id: str, size: str = None, color: str = N
 
 def search_faq(query: str) -> dict:
     """
-    Tìm câu trả lời trong FAQ dựa trên từ khoá.
-    Args:   query — câu hỏi hoặc từ khoá (VD: "đổi trả", "phí ship", "thanh toán")
-    Return: {results: [{question, answer}]} — tối đa 3 kết quả liên quan
-    Errors: no_results nếu không tìm thấy gì liên quan
+    Tìm câu trả lời FAQ theo câu hỏi hoặc từ khóa.
+    Args:
+        query — câu hỏi hoặc từ khóa của khách
+    Return: {faq_id, question, answer}
+    Errors: faq_not_found, query_empty
     """
-    if not query or len(query.strip()) < 2:
-        return {"error": "query_too_short", "message": "Vui lòng nhập từ khoá tìm kiếm"}
+    normalized_query = (query or "").strip().lower()
+    if not normalized_query:
+        return {"error": "query_empty", "message": "Vui lòng nhập nội dung cần tìm trong FAQ"}
 
-    query_lower = query.lower()
-    matches = []
-    for faq in FAQ_DB:
-        if any(word in faq["question"].lower() or word in faq["answer"].lower()
-               for word in query_lower.split()):
-            matches.append({"question": faq["question"], "answer": faq["answer"]})
+    best_match = None
+    best_score = 0
+    query_terms = set(normalized_query.replace("?", " ").replace(",", " ").split())
 
-    if not matches:
-        return {
-            "error": "no_results",
-            "message": f"Không tìm thấy FAQ liên quan đến '{query}'. Thử: 'đổi trả', 'ship', 'thanh toán', 'lỗi hàng'",
-        }
+    for item in FAQ_DB:
+        searchable = f"{item['question']} {item['answer']}".lower()
+        score = sum(1 for term in query_terms if term in searchable)
+        if normalized_query in searchable:
+            score += 5
+        if score > best_score:
+            best_score = score
+            best_match = item
+
+    if not best_match or best_score == 0:
+        return {"error": "faq_not_found", "message": "Không tìm thấy FAQ phù hợp"}
 
     return {
         "success": True,
-        "query": query,
-        "results": matches[:3],
-        "total_found": len(matches),
+        "faq_id": best_match["id"],
+        "question": best_match["question"],
+        "answer": best_match["answer"],
     }
 
 
@@ -86,7 +91,7 @@ TOOLS_P4 = [
     },
     {
         "name": "search_faq",
-        "description": "Tìm kiếm câu hỏi thường gặp theo từ khoá. Dùng khi khách hỏi về chính sách, quy trình, hoặc thông tin chung.",
+        "description": "Tìm câu trả lời FAQ/chính sách như đổi trả, phí vận chuyển, thời gian nhận hàng, thanh toán, hàng lỗi.",
         "function": search_faq,
     },
 ]

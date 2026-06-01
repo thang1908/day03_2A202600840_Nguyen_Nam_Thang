@@ -15,7 +15,21 @@ cp .env.example .env
 pip install -r requirements.txt
 ```
 
-### 3. Directory Structure
+### 3. Run Chatbot Baseline v1
+Run the direct chatbot baseline before the ReAct agent:
+```bash
+python3 chatbot.py
+```
+
+This baseline does not use tools. It logs `CHATBOT_BASELINE_*` events to
+`logs/YYYY-MM-DD.log` and is expected to fail database-backed questions.
+
+### 4. Run ReAct Agent v2 Test Suite
+```bash
+python3 main.py
+```
+
+### 5. Directory Structure
 - `src/tools/`: Extension point for your custom tools.
 
 ## 🏠 Running with Local Models (CPU)
