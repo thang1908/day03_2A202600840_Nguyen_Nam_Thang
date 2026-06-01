@@ -1,5 +1,10 @@
+import argparse
+import json
 import os
-from typing import Any, Dict, Optional
+import re
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Dict, Generator, List, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -7,6 +12,8 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from src.agent.agent import ReActAgent
+from src.core.llm_provider import LLMProvider
+from src.telemetry.logger import logger
 from tools.registry import ALL_TOOLS
 
 
@@ -59,6 +66,266 @@ def get_agent() -> ReActAgent:
     if _agent is None:
         _agent = ReActAgent(llm=create_llm_provider(), tools=ALL_TOOLS, max_steps=6)
     return _agent
+
+
+@dataclass(frozen=True)
+class AgentTestCase:
+    name: str
+    question: str
+    expected_keywords: List[str]
+    expected_failure: bool = False
+    note: str = ""
+
+
+TEST_CASES = [
+    AgentTestCase(
+        name="order_status_shipping",
+        question="Đơn ORD-002 của tôi đang ở đâu?",
+        expected_keywords=["ORD-002", "Đang giao hàng", "2026-05-30"],
+    ),
+    AgentTestCase(
+        name="order_details_delivered",
+        question="Cho tôi xem chi tiết đơn ORD-001",
+        expected_keywords=["ORD-001", "Áo thun basic", "1,500,000đ"],
+    ),
+    AgentTestCase(
+        name="count_delivered_orders",
+        question="Hiện có bao nhiêu đơn đã giao thành công?",
+        expected_keywords=["2", "delivered"],
+    ),
+    AgentTestCase(
+        name="missing_order",
+        question="Kiểm tra giúp tôi đơn ORD-999",
+        expected_keywords=["Không tìm thấy", "ORD-999"],
+    ),
+    AgentTestCase(
+        name="malformed_order_id_no_hyphen",
+        question="Đơn ORD002 của tôi đang ở đâu?",
+        expected_keywords=["ORD-002", "Đang giao hàng"],
+        note="V2 normalize mã đơn thiếu dấu gạch ngang từ ORD002 thành ORD-002.",
+    ),
+    AgentTestCase(
+        name="shipping_eta_tracking",
+        question="Đơn ORD-002 dự kiến giao ngày nào?",
+        expected_keywords=["2026-06-02", "GHTK789012"],
+        note="V2 route câu hỏi ETA/tracking sang get_shipping_info.",
+    ),
+    AgentTestCase(
+        name="faq_return_policy",
+        question="Chính sách đổi trả như thế nào?",
+        expected_keywords=["Đổi trả trong 7 ngày", "nguyên tag"],
+        note="V2 dùng search_faq để trả lời chính sách từ FAQ_DB.",
+    ),
+]
+
+
+class TestCaseLLMProvider(LLMProvider):
+    """
+    Mock LLM for local testcase runs.
+    It returns ReAct-formatted responses so tests exercise the real agent parser
+    and tool execution without requiring an API key.
+    """
+
+    def __init__(self):
+        super().__init__(model_name="testcase-mock")
+
+    def generate(self, prompt: str, system_prompt: Optional[str] = None) -> Dict[str, Any]:
+        content = self._next_response(prompt)
+        return {
+            "content": content,
+            "provider": "mock",
+            "usage": {
+                "prompt_tokens": len(prompt.split()),
+                "completion_tokens": len(content.split()),
+                "total_tokens": len(prompt.split()) + len(content.split()),
+            },
+            "latency_ms": 0,
+        }
+
+    def stream(self, prompt: str, system_prompt: Optional[str] = None) -> Generator[str, None, None]:
+        yield self.generate(prompt, system_prompt=system_prompt)["content"]
+
+    def _next_response(self, prompt: str) -> str:
+        question = self._extract_question(prompt)
+
+        if "Observation:" not in prompt:
+            return self._first_action(question)
+
+        observation = self._latest_observation(prompt)
+        return self._final_answer(question, observation)
+
+    def _extract_question(self, prompt: str) -> str:
+        first_line = prompt.splitlines()[0] if prompt.splitlines() else ""
+        return first_line.replace("Question:", "", 1).strip()
+
+    def _first_action(self, question: str) -> str:
+        normalized = question.lower()
+        order_id = self._extract_order_id(question)
+
+        if "chính sách" in normalized or "đổi trả" in normalized:
+            return f'Thought: Cần tìm chính sách phù hợp trong FAQ.\nAction: search_faq(query="{question}")'
+
+        if order_id and any(keyword in normalized for keyword in ("dự kiến", "tracking", "vận chuyển", "giao ngày")):
+            return f'Thought: Cần lấy thông tin vận chuyển và ngày giao dự kiến.\nAction: get_shipping_info(order_id="{order_id}")'
+
+        if "bao nhiêu" in normalized and "đã giao" in normalized:
+            return 'Thought: Cần đếm các đơn đã giao.\nAction: count_orders(status="delivered")'
+
+        if "chi tiết" in normalized and order_id:
+            return f'Thought: Cần lấy chi tiết đơn hàng.\nAction: get_order_details(order_id="{order_id}")'
+
+        if order_id:
+            return f'Thought: Cần kiểm tra trạng thái đơn hàng.\nAction: get_order_status(order_id="{order_id}")'
+
+        return "Final Answer: Bạn vui lòng cung cấp mã đơn hàng để tôi kiểm tra."
+
+    def _extract_order_id(self, text: str) -> Optional[str]:
+        match = re.search(r"\bORD[-\s]?(\d{3})\b", text, flags=re.IGNORECASE)
+        if match:
+            return f"ORD-{match.group(1)}"
+        return None
+
+    def _latest_observation(self, prompt: str) -> Dict[str, Any]:
+        raw_observation = prompt.rsplit("Observation:", 1)[-1].strip()
+        try:
+            return json.loads(raw_observation)
+        except json.JSONDecodeError:
+            return {"raw": raw_observation}
+
+    def _final_answer(self, question: str, observation: Dict[str, Any]) -> str:
+        if observation.get("error"):
+            return f"Thought: Tool trả về lỗi.\nFinal Answer: {observation.get('message', 'Không tìm thấy thông tin phù hợp.')}"
+
+        if "count" in observation:
+            return (
+                "Thought: Đã có số lượng đơn hàng.\n"
+                f"Final Answer: Có {observation['count']} đơn hàng trạng thái {observation['status']}."
+            )
+
+        if "product_name" in observation:
+            return (
+                "Thought: Đã có chi tiết đơn hàng.\n"
+                f"Final Answer: Đơn {observation['order_id']} gồm {observation['quantity']} x "
+                f"{observation['product_name']}, tổng tiền {observation['total']}."
+            )
+
+        if "tracking_code" in observation:
+            return (
+                "Thought: Đã có thông tin vận chuyển.\n"
+                f"Final Answer: Đơn {observation['order_id']} đang được giao bởi {observation['carrier']}, "
+                f"mã tracking {observation['tracking_code']}, dự kiến giao ngày "
+                f"{observation['estimated_delivery_date']}."
+            )
+
+        if "faq_id" in observation:
+            return (
+                "Thought: Đã tìm thấy câu trả lời FAQ phù hợp.\n"
+                f"Final Answer: {observation['answer']}"
+            )
+
+        if "status_vn" in observation:
+            return (
+                "Thought: Đã có trạng thái đơn hàng.\n"
+                f"Final Answer: Đơn {observation['order_id']} hiện là {observation['status_vn']}, "
+                f"ngày đặt {observation['order_date']}."
+            )
+
+        return "Final Answer: Tôi chưa tìm được thông tin phù hợp cho yêu cầu này."
+
+
+def run_testcases(use_real_llm: bool = False) -> int:
+    agent = ReActAgent(
+        llm=create_llm_provider() if use_real_llm else TestCaseLLMProvider(),
+        tools=ALL_TOOLS,
+        max_steps=6,
+    )
+    started_at = datetime.now().isoformat(timespec="seconds")
+    results = []
+
+    logger.log_event(
+        "TESTCASE_RUN_START",
+        {"started_at": started_at, "total": len(TEST_CASES), "use_real_llm": use_real_llm},
+    )
+    print(f"Running {len(TEST_CASES)} testcases | real_llm={use_real_llm}")
+
+    for index, test_case in enumerate(TEST_CASES, start=1):
+        print(f"\n[{index}/{len(TEST_CASES)}] {test_case.name}")
+        print(f"Question: {test_case.question}")
+
+        try:
+            result = agent.run_with_trace(test_case.question)
+            answer = result["answer"]
+            assertion_passed = all(keyword.lower() in answer.lower() for keyword in test_case.expected_keywords)
+            if assertion_passed and test_case.expected_failure:
+                status = "XPASS"
+            elif assertion_passed:
+                status = "PASS"
+            elif test_case.expected_failure:
+                status = "XFAIL"
+            else:
+                status = "FAIL"
+            passed = status in {"PASS", "XFAIL"}
+            steps = len(result["trace"])
+            print(f"Status: {status}")
+            print(f"Answer: {answer}")
+            if test_case.note:
+                print(f"Note: {test_case.note}")
+            print(f"Steps: {steps}")
+
+            payload = {
+                "name": test_case.name,
+                "question": test_case.question,
+                "expected_keywords": test_case.expected_keywords,
+                "expected_failure": test_case.expected_failure,
+                "note": test_case.note,
+                "answer": answer,
+                "steps": steps,
+                "assertion_passed": assertion_passed,
+                "status": status,
+                "passed": passed,
+                "trace": result["trace"],
+            }
+            results.append(payload)
+            logger.log_event("TESTCASE_RESULT", payload)
+        except Exception as exc:
+            payload = {
+                "name": test_case.name,
+                "question": test_case.question,
+                "expected_keywords": test_case.expected_keywords,
+                "expected_failure": test_case.expected_failure,
+                "note": test_case.note,
+                "assertion_passed": False,
+                "status": "XFAIL" if test_case.expected_failure else "FAIL",
+                "passed": test_case.expected_failure,
+                "error": str(exc),
+            }
+            results.append(payload)
+            logger.log_event("TESTCASE_RESULT", payload)
+            print(f"Status: {payload['status']}")
+            print(f"Error: {exc}")
+
+    pass_count = sum(1 for item in results if item["status"] == "PASS")
+    xfail_count = sum(1 for item in results if item["status"] == "XFAIL")
+    fail_count = sum(1 for item in results if item["status"] == "FAIL")
+    xpass_count = sum(1 for item in results if item["status"] == "XPASS")
+    unexpected_count = fail_count + xpass_count
+    summary = {
+        "started_at": started_at,
+        "total": len(results),
+        "passed": pass_count,
+        "expected_failed": xfail_count,
+        "failed": fail_count,
+        "unexpected_passed": xpass_count,
+        "unexpected": unexpected_count,
+        "use_real_llm": use_real_llm,
+    }
+    logger.log_event("TESTCASE_RUN_END", summary)
+    print(
+        f"\nSummary: {pass_count} passed, {xfail_count} expected failures, "
+        f"{unexpected_count} unexpected outcomes"
+    )
+    print("Logs: logs/<today>.log")
+    return 0 if unexpected_count == 0 else 1
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -449,3 +716,18 @@ HTML = """
 </body>
 </html>
 """
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Run customer support agent testcases.")
+    parser.add_argument(
+        "--use-real-llm",
+        action="store_true",
+        help="Use DEFAULT_PROVIDER from .env instead of the deterministic mock provider.",
+    )
+    args = parser.parse_args()
+    return run_testcases(use_real_llm=args.use_real_llm)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
